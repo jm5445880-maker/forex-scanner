@@ -19,27 +19,26 @@ VOLUME_MA_LENGTH         = 20
 USE_VOLUME_SPIKE         = True
 VOLUME_SPIKE_MULTIPLIER  = 1.4
 
-ALPHA_VANTAGE_KEY = "YW0G1L2AN9QJ8MIH"
-
+TWELVE_DATA_KEY  = "9d4be446a0c141ab95608b044b8da5c4"
 TELEGRAM_TOKEN   = "8679884583:AAEqFAjPY5nX4Z7wM2jGS7Oe58xxy4EqkPU"
 TELEGRAM_CHAT_ID = "7313311226"
 
-# Major forex pairs in Alpha Vantage format (from_currency / to_currency)
+# All 8 major forex pairs
 PAIRS = [
-    ("EUR", "USD", "EURUSD"),
-    ("GBP", "USD", "GBPUSD"),
-    ("USD", "JPY", "USDJPY"),
-    ("USD", "CHF", "USDCHF"),
-    ("AUD", "USD", "AUDUSD"),
-    ("USD", "CAD", "USDCAD"),
-    ("NZD", "USD", "NZDUSD"),
-    ("EUR", "GBP", "EURGBP"),
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "AUD/USD",
+    "USD/CAD",
+    "NZD/USD",
+    "EUR/GBP",
 ]
 
-# Alpha Vantage free tier = 25 requests/day, 5 per minute
-# 8 pairs × 1 request each = 8 requests per scan
-# We scan every 60 minutes to stay well within limits
-CHECK_INTERVAL = 3600  # 60 minutes
+# Scan every 60 minutes
+# 8 pairs x 1 request = 8 requests per scan
+# 24 scans x 8 = 192 requests per day (well within 800 limit)
+CHECK_INTERVAL = 3600
 
 # ─── DUPLICATE ALERT PREVENTION ───────────────────────────────────────────
 last_alerted = {}
@@ -75,49 +74,54 @@ def calc_atr(highs, lows, closes, period):
         atr_vals.append(atr)
     return atr_vals
 
-# ─── FETCH FROM ALPHA VANTAGE ─────────────────────────────────────────────
-def fetch_and_analyze(from_cur, to_cur, name):
+# ─── FETCH FROM TWELVE DATA ───────────────────────────────────────────────
+def fetch_and_analyze(pair):
+    name = pair.replace("/", "")
     try:
         url = (
-            f"https://www.alphavantage.co/query"
-            f"?function=FX_INTRADAY"
-            f"&from_symbol={from_cur}"
-            f"&to_symbol={to_cur}"
-            f"&interval=60min"
-            f"&outputsize=full"
-            f"&apikey={ALPHA_VANTAGE_KEY}"
+            f"https://api.twelvedata.com/time_series"
+            f"?symbol={pair}"
+            f"&interval=1h"
+            f"&outputsize=100"
+            f"&apikey={TWELVE_DATA_KEY}"
         )
         r = requests.get(url, timeout=20)
         data = r.json()
 
-        key = "Time Series FX (60min)"
-        if key not in data:
-            print(f"  {name}: bad response from Alpha Vantage - {data.get('Note') or data.get('Information') or 'unknown error'}")
+        if data.get("status") == "error":
+            print(f"  {name}: API error - {data.get('message')}")
             return None
 
-        ts = data[key]
-        # Sort oldest to newest
-        sorted_times = sorted(ts.keys())
+        values = data.get("values")
+        if not values or len(values) < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
+            print(f"  {name}: not enough data")
+            return None
 
-        opens   = [float(ts[t]["1. open"])  for t in sorted_times]
-        highs   = [float(ts[t]["2. high"])  for t in sorted_times]
-        lows    = [float(ts[t]["3. low"])   for t in sorted_times]
-        closes  = [float(ts[t]["4. close"]) for t in sorted_times]
+        # Twelve Data returns newest first — reverse to oldest first
+        values = list(reversed(values))
 
-        # Alpha Vantage FX intraday does NOT have volume — it returns 0
-        # We use tick count proxy: candle body + range as activity measure
-        # For volume filter we use a synthetic volume = (high - low) * 100000
-        # This is standard practice for forex — pip movement as volume proxy
-        volumes = [(highs[i] - lows[i]) * 100000 for i in range(len(closes))]
+        timestamps = [v["datetime"] for v in values]
+        opens      = [float(v["open"])   for v in values]
+        highs      = [float(v["high"])   for v in values]
+        lows       = [float(v["low"])    for v in values]
+        closes     = [float(v["close"])  for v in values]
+
+        # Twelve Data provides real volume for forex
+        # If volume is missing or zero, fall back to pip range proxy
+        raw_volumes = []
+        for v in values:
+            vol = v.get("volume")
+            if vol and float(vol) > 0:
+                raw_volumes.append(float(vol))
+            else:
+                raw_volumes.append((float(v["high"]) - float(v["low"])) * 100000)
+        volumes = raw_volumes
 
         n = len(closes)
-        if n < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
-            print(f"  {name}: not enough candles ({n})")
-            return None
 
         # Use last FULLY CLOSED candle (second to last)
-        idx        = n - 2
-        candle_ts  = sorted_times[idx]
+        idx       = n - 2
+        candle_ts = timestamps[idx]
 
         atr_vals = calc_atr(highs, lows, closes, ATR_LENGTH)
         atr_idx  = len(atr_vals) - 2
@@ -136,8 +140,8 @@ def fetch_and_analyze(from_cur, to_cur, name):
         is_above_vol_ma = volume_now > vol_ma
         is_spike        = volume_now >= vol_ma * VOLUME_SPIKE_MULTIPLIER
 
-        pass_vol   = is_above_vol_ma if USE_VOLUME_FILTER else True
-        pass_spike = is_spike        if USE_VOLUME_SPIKE  else True
+        pass_vol   = is_above_vol_ma if USE_VOLUME_FILTER  else True
+        pass_spike = is_spike        if USE_VOLUME_SPIKE   else True
 
         is_strong = is_strong_atr and pass_vol and pass_spike
         is_bull   = closes[idx] > opens[idx]
@@ -150,6 +154,7 @@ def fetch_and_analyze(from_cur, to_cur, name):
             "volume":       volume_now,
             "vol_ma":       vol_ma,
             "candle_ts":    candle_ts,
+            "name":         name,
         }
 
     except Exception as e:
@@ -161,11 +166,12 @@ def scan():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scanning {len(PAIRS)} pairs...")
     signals_found = 0
 
-    for from_cur, to_cur, name in PAIRS:
-        result = fetch_and_analyze(from_cur, to_cur, name)
+    for pair in PAIRS:
+        name   = pair.replace("/", "")
+        result = fetch_and_analyze(pair)
 
-        # Alpha Vantage free = 5 requests/min — wait 13s between each pair
-        time.sleep(13)
+        # Twelve Data allows 8 requests/minute — wait 8 seconds between each
+        time.sleep(8)
 
         if result is None:
             continue
@@ -181,8 +187,8 @@ def scan():
             last_alerted[name] = candle_ts
             signals_found += 1
 
-            direction   = "Bullish" if result["is_bull"] else "Bearish"
-            emoji       = "\U0001f7e2" if result["is_bull"] else "\U0001f534"
+            direction = "Bullish" if result["is_bull"] else "Bearish"
+            emoji     = "\U0001f7e2" if result["is_bull"] else "\U0001f534"
 
             msg = (
                 f"\u26a1 <b>Strong Candle Detected!</b>\n\n"
@@ -192,11 +198,11 @@ def scan():
                 f"Candle range: {result['candle_range']:.5f}\n"
                 f"ATR ({ATR_LENGTH}): {result['atr']:.5f}\n"
                 f"Range/ATR ratio: {result['candle_range'] / (ATR_MULTIPLIER * result['atr']):.2f}x\n"
-                f"Range vs MA ratio: {result['volume'] / result['vol_ma']:.2f}x\n\n"
+                f"Volume vs MA: {result['volume'] / result['vol_ma']:.2f}x\n\n"
                 f"Timeframe: 1H"
             )
 
-            print(f"  {name}: STRONG CANDLE! {direction} - sending alert...")
+            print(f"  {name}: STRONG CANDLE! {direction} - sending Telegram alert...")
             send_telegram(msg)
         else:
             print(f"  {name}: no signal")
@@ -207,11 +213,12 @@ def scan():
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────
 def scanner_loop():
     send_telegram(
-        "\u2705 <b>Forex Scanner restarted with better data!</b>\n\n"
-        "Now using Alpha Vantage for accurate forex data.\n"
+        "\u2705 <b>Forex Scanner is now running 24/7!</b>\n\n"
+        "Powered by Twelve Data — proper forex data.\n"
         "Scanning all 8 major pairs every hour.\n"
         "You will only hear from me when a strong candle forms.\n\n"
-        f"Settings: ATR {ATR_LENGTH} x{ATR_MULTIPLIER} | Vol MA {VOLUME_MA_LENGTH} | Spike x{VOLUME_SPIKE_MULTIPLIER}"
+        f"Settings: ATR {ATR_LENGTH} x{ATR_MULTIPLIER} | "
+        f"Vol MA {VOLUME_MA_LENGTH} | Spike x{VOLUME_SPIKE_MULTIPLIER}"
     )
     while True:
         scan()
