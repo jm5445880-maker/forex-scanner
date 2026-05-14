@@ -1,7 +1,7 @@
 import requests
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask
 
@@ -24,7 +24,6 @@ TWELVE_DATA_KEY  = "9d4be446a0c141ab95608b044b8da5c4"
 TELEGRAM_TOKEN   = "8679884583:AAEqFAjPY5nX4Z7wM2jGS7Oe58xxy4EqkPU"
 TELEGRAM_CHAT_ID = "7313311226"
 
-# Ireland timezone — handles DST automatically forever
 IRELAND_TZ = ZoneInfo("Europe/Dublin")
 
 # 7 true major forex pairs only
@@ -38,7 +37,9 @@ PAIRS = [
     "NZD/USD",
 ]
 
-CHECK_INTERVAL = 3600  # 60 minutes
+# 20 seconds between pairs = ~3 requests/min, well under 8/min limit
+PAIR_DELAY     = 20
+CHECK_INTERVAL = 3600  # scan every 60 minutes
 
 # ─── SESSION OPEN TIMES (Irish local hour) ────────────────────────────────
 SESSION_OPENS = {
@@ -48,10 +49,10 @@ SESSION_OPENS = {
 }
 
 # ─── STATE TRACKING ───────────────────────────────────────────────────────
-last_alerted      = {}   # last candle timestamp alerted per pair
-last_session_day  = {}   # last date session message was sent per hour
-fail_count        = {p.replace("/",""): 0 for p in PAIRS}   # consecutive fail count
-fail_warned       = {p.replace("/",""): False for p in PAIRS}  # whether first warning was sent
+last_alerted     = {}
+last_session_day = {}
+fail_count       = {p.replace("/", ""): 0     for p in PAIRS}
+fail_warned      = {p.replace("/", ""): False  for p in PAIRS}
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────
 def send_telegram(msg):
@@ -70,24 +71,21 @@ def send_telegram(msg):
             time.sleep(3)
     return False
 
-# ─── FAILURE STATUS HELPER ────────────────────────────────────────────────
+# ─── HEALTH SUMMARY ───────────────────────────────────────────────────────
 def get_failing_pairs():
-    """Returns list of (name, fail_count) for all currently failing pairs."""
     return [(name, count) for name, count in fail_count.items() if count >= 3]
 
 def get_health_summary():
-    """Returns a health status string for use in session messages."""
     failing = get_failing_pairs()
     total   = len(PAIRS)
     if not failing:
         return f"\u2705 All {total} pairs scanning normally."
-    else:
-        healthy = total - len(failing)
-        lines   = [f"\u26a0\ufe0f Pair issues detected:"]
-        for name, count in failing:
-            lines.append(f"  - {name}: failed {count} scans in a row")
-        lines.append(f"\n{healthy} of {total} pairs scanning normally.")
-        return "\n".join(lines)
+    healthy = total - len(failing)
+    lines   = ["\u26a0\ufe0f Pair issues detected:"]
+    for name, count in failing:
+        lines.append(f"  - {name}: failed {count} scans in a row")
+    lines.append(f"\n{healthy} of {total} pairs scanning normally.")
+    return "\n".join(lines)
 
 # ─── SESSION OPEN CHECKER ─────────────────────────────────────────────────
 def check_session_opens():
@@ -112,37 +110,22 @@ def check_session_opens():
 
 # ─── FAILURE WARNING ──────────────────────────────────────────────────────
 def check_failure_warning(name):
-    """
-    Called after a pair fails.
-    Sends a standalone warning only the FIRST time a pair hits 3 failures.
-    If other pairs are also already failing, includes them in the message.
-    """
     count = fail_count[name]
-
-    # Only trigger at exactly 3 — and only if we haven't warned yet for this pair
     if count == 3 and not fail_warned[name]:
         fail_warned[name] = True
-
-        # Build message
         msg_lines = [
             f"\u26a0\ufe0f <b>Scanner Warning</b>\n",
             f"<b>{name}</b> has failed 3 scans in a row.",
             f"Data could not be fetched from Twelve Data.",
             f"You may be missing signals on this pair.",
         ]
-
-        # Include other already-failing pairs (excluding the current one)
         other_failing = [(n, c) for n, c in get_failing_pairs() if n != name]
         if other_failing:
             msg_lines.append(f"\n\u26a0\ufe0f Also still failing:")
             for n, c in other_failing:
                 msg_lines.append(f"  - {n}: {c} scans failed in a row")
-
-        # How many healthy
-        total_failing = len(get_failing_pairs())
-        healthy = len(PAIRS) - total_failing
+        healthy = len(PAIRS) - len(get_failing_pairs())
         msg_lines.append(f"\n{healthy} of {len(PAIRS)} pairs scanning normally.")
-
         send_telegram("\n".join(msg_lines))
         print(f"  Failure warning sent for {name}")
 
@@ -165,30 +148,49 @@ def calc_atr(highs, lows, closes, period):
         atr_vals.append(atr)
     return atr_vals
 
-# ─── FETCH AND ANALYZE ONE PAIR ───────────────────────────────────────────
-def fetch_and_analyze(pair):
+# ─── FETCH ONE PAIR (with rate limit detection and auto-retry) ────────────
+def fetch_pair(pair):
+    """
+    Fetches data for one pair from Twelve Data.
+    Returns: parsed values list, or None on real error, or "RATE_LIMIT" string
+    """
     name = pair.replace("/", "")
+    url  = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={pair}"
+        f"&interval=1h"
+        f"&outputsize=100"
+        f"&apikey={TWELVE_DATA_KEY}"
+    )
     try:
-        url = (
-            f"https://api.twelvedata.com/time_series"
-            f"?symbol={pair}"
-            f"&interval=1h"
-            f"&outputsize=100"
-            f"&apikey={TWELVE_DATA_KEY}"
-        )
-        r       = requests.get(url, timeout=20)
-        data    = r.json()
+        r    = requests.get(url, timeout=20)
+        data = r.json()
 
         if data.get("status") == "error":
-            print(f"  {name}: API error - {data.get('message')}")
+            msg = data.get("message", "").lower()
+            code = data.get("code", 0)
+            # Detect rate limit specifically
+            if "too many" in msg or "rate limit" in msg or code == 429:
+                print(f"  {name}: rate limit hit — will retry after 60s")
+                return "RATE_LIMIT"
+            print(f"  {name}: API error — {data.get('message')}")
             return None
 
         values = data.get("values")
         if not values or len(values) < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
-            print(f"  {name}: not enough data")
+            print(f"  {name}: not enough data ({len(values) if values else 0} candles)")
             return None
 
-        # Reverse to oldest first
+        return values
+
+    except Exception as e:
+        print(f"  {name}: fetch error — {e}")
+        return None
+
+# ─── ANALYZE ONE PAIR ─────────────────────────────────────────────────────
+def analyze(pair, values):
+    name = pair.replace("/", "")
+    try:
         values     = list(reversed(values))
         timestamps = [v["datetime"] for v in values]
         opens      = [float(v["open"])  for v in values]
@@ -196,7 +198,6 @@ def fetch_and_analyze(pair):
         lows       = [float(v["low"])   for v in values]
         closes     = [float(v["close"]) for v in values]
 
-        # Real tick volume
         volumes = []
         for v in values:
             raw = v.get("volume")
@@ -209,9 +210,8 @@ def fetch_and_analyze(pair):
         idx       = n - 2
         candle_ts = timestamps[idx]
 
-        # ── STALE CANDLE GUARD ───────────────────────────────────────────
+        # Stale candle guard
         try:
-            from datetime import timezone
             candle_dt = datetime.strptime(candle_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             age_hours = (datetime.now(timezone.utc) - candle_dt).total_seconds() / 3600
             if age_hours > 2:
@@ -220,7 +220,6 @@ def fetch_and_analyze(pair):
         except Exception:
             pass
 
-        # ── CALCULATIONS ─────────────────────────────────────────────────
         atr_vals = calc_atr(highs, lows, closes, ATR_LENGTH)
         atr_idx  = len(atr_vals) - 2
         if atr_idx < 0:
@@ -229,23 +228,27 @@ def fetch_and_analyze(pair):
         vol_window = volumes[idx - VOLUME_MA_LENGTH + 1: idx + 1]
         if len(vol_window) < VOLUME_MA_LENGTH:
             return None
+
         vol_ma       = sum(vol_window) / VOLUME_MA_LENGTH
         candle_range = highs[idx] - lows[idx]
         atr_now      = atr_vals[atr_idx]
         volume_now   = volumes[idx]
 
-        # ── RULE 1: STRICT ATR HARD BLOCK ────────────────────────────────
         if atr_now == 0:
             return None
+
+        # Rule 1: strict ATR hard block
         atr_ratio = candle_range / atr_now
         if atr_ratio < ATR_MULTIPLIER:
             print(f"  {name}: ATR {atr_ratio:.2f}x < {ATR_MULTIPLIER}x — blocked")
             return None
 
-        # ── RULE 2 & 3: VOLUME FILTERS ───────────────────────────────────
-        is_above_vol_ma = (volume_now > vol_ma)      if USE_VOLUME_FILTER else True
-        vol_ratio       = (volume_now / vol_ma)      if vol_ma > 0        else 0
-        is_spike        = (vol_ratio >= VOLUME_SPIKE_MULTIPLIER) if USE_VOLUME_SPIKE else True
+        # Rule 2: volume above MA
+        is_above_vol_ma = (volume_now > vol_ma) if USE_VOLUME_FILTER else True
+
+        # Rule 3: volume spike
+        vol_ratio = (volume_now / vol_ma) if vol_ma > 0 else 0
+        is_spike  = (vol_ratio >= VOLUME_SPIKE_MULTIPLIER) if USE_VOLUME_SPIKE else True
 
         is_strong = is_above_vol_ma and is_spike
         is_bull   = closes[idx] > opens[idx]
@@ -264,38 +267,57 @@ def fetch_and_analyze(pair):
         }
 
     except Exception as e:
-        print(f"  {name}: unexpected error — {e}")
+        print(f"  {name}: analyze error — {e}")
         return None
 
 # ─── SCAN ALL PAIRS ───────────────────────────────────────────────────────
 def scan():
-    from datetime import timezone
     print(f"\n[{datetime.now(IRELAND_TZ).strftime('%Y-%m-%d %H:%M')} Irish] Scanning {len(PAIRS)} pairs...")
     signals_found = 0
 
     for pair in PAIRS:
-        name = pair.replace("/", "")
-        result = None
+        name   = pair.replace("/", "")
+        values = None
+
         try:
-            result = fetch_and_analyze(pair)
+            values = fetch_pair(pair)
+
+            # If rate limited — wait 60s and retry ONCE
+            if values == "RATE_LIMIT":
+                print(f"  {name}: waiting 60s then retrying...")
+                time.sleep(60)
+                values = fetch_pair(pair)
+                if values == "RATE_LIMIT":
+                    print(f"  {name}: still rate limited after retry — skipping")
+                    values = None
+
         except Exception as e:
-            print(f"  {name}: crashed during fetch — {e}")
+            print(f"  {name}: unexpected fetch crash — {e}")
+            values = None
 
-        # Wait between requests (Twelve Data rate limit)
-        time.sleep(9)
+        # Wait 20s before next pair regardless
+        time.sleep(PAIR_DELAY)
 
-        if result is None:
-            # Count the failure
+        if values is None or values == "RATE_LIMIT":
             fail_count[name] += 1
-            print(f"  {name}: fail count now {fail_count[name]}")
+            print(f"  {name}: fail count = {fail_count[name]}")
             check_failure_warning(name)
             continue
 
-        # Pair succeeded — reset failure tracking
+        # Pair fetched successfully — reset failure state
         if fail_count[name] > 0:
             print(f"  {name}: recovered after {fail_count[name]} failures")
         fail_count[name]  = 0
         fail_warned[name] = False
+
+        result = None
+        try:
+            result = analyze(pair, values)
+        except Exception as e:
+            print(f"  {name}: analyze crash — {e}")
+
+        if result is None:
+            continue
 
         if result["is_strong"]:
             candle_ts = result["candle_ts"]
@@ -341,15 +363,12 @@ def scan():
 # ─── MAIN LOOP WITH FULL CRASH RECOVERY ───────────────────────────────────
 def scanner_loop():
     send_telegram(
-        "\u2705 <b>Forex Scanner — fully rebuilt!</b>\n\n"
-        "What's new:\n"
-        "- Full crash recovery (never dies on errors)\n"
-        "- Smart pair failure tracking & warnings\n"
-        "- Session open messages with health status\n"
-        "- Auto DST handling for Ireland — forever\n"
-        "- Strict ATR hard block (1.4x minimum)\n"
-        "- Real tick volume from Twelve Data\n"
-        "- 7 majors only, EURGBP removed\n\n"
+        "\u2705 <b>Forex Scanner — rate limit fix deployed!</b>\n\n"
+        "Changes:\n"
+        "- 20s between pairs (safe rate limit buffer)\n"
+        "- Rate limit detected and auto-retried\n"
+        "- Real errors vs rate limits handled separately\n"
+        "- All previous fixes retained\n\n"
         f"Settings: ATR {ATR_LENGTH} x{ATR_MULTIPLIER} | "
         f"Vol MA {VOLUME_MA_LENGTH} | Spike x{VOLUME_SPIKE_MULTIPLIER}"
     )
