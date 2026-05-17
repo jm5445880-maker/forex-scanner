@@ -418,6 +418,8 @@ def scan():
             else:
                 vol_line = "Volume spike ratio: N/A (no tick data)"
 
+            vol_ma_str = "N/A" if not result["volume_available"] else str(int(result["vol_ma"]))
+
             msg = (
                 f"\u26a1 <b>Strong Candle Detected!</b>\n\n"
                 f"Pair: <b>{name}</b>\n"
@@ -425,8 +427,7 @@ def scan():
                 f"Candle open: {time_str}\n\n"
                 f"ATR ({ATR_LENGTH}): {result['atr']:.5f}\n"
                 f"ATR ratio: {result['atr_ratio']:.2f}x\n"
-                f"Volume MA ({VOLUME_MA_LENGTH}): "
-                f"{'N/A' if not result['volume_available'] else f\"{result['vol_ma']:.0f}\"}\n"
+                f"Volume MA ({VOLUME_MA_LENGTH}): {vol_ma_str}\n"
                 f"{vol_line}\n\n"
                 f"Timeframe: 1H"
             )
