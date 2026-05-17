@@ -1,14 +1,13 @@
+import os
 import requests
 import time
 import threading
-import sys
-import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask
 
 # ─────────────────────────────────────────────────────────────────────────
-# FLASK (background thread — keeps Render alive via UptimeRobot pings)
+# FLASK (background thread)
 # ─────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -20,6 +19,13 @@ def run_flask():
     app.run(host="0.0.0.0", port=10000)
 
 # ─────────────────────────────────────────────────────────────────────────
+# SECRETS — loaded from environment variables (set these in Render)
+# ─────────────────────────────────────────────────────────────────────────
+TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# ─────────────────────────────────────────────────────────────────────────
 # YOUR SETTINGS
 # ─────────────────────────────────────────────────────────────────────────
 ATR_LENGTH               = 14
@@ -28,10 +34,6 @@ USE_VOLUME_FILTER        = True
 VOLUME_MA_LENGTH         = 20
 USE_VOLUME_SPIKE         = True
 VOLUME_SPIKE_MULTIPLIER  = 1.4
-
-TWELVE_DATA_KEY  = "9d4be446a0c141ab95608b044b8da5c4"
-TELEGRAM_TOKEN   = "8679884583:AAEqFAjPY5nX4Z7wM2jGS7Oe58xxy4EqkPU"
-TELEGRAM_CHAT_ID = "7313311226"
 
 IRELAND_TZ = ZoneInfo("Europe/Dublin")
 
@@ -45,11 +47,11 @@ PAIRS = [
     "NZD/USD",
 ]
 
-PAIR_DELAY     = 20    # seconds between each pair fetch
-CHECK_INTERVAL = 3600  # full scan every 60 minutes
+PAIR_DELAY     = 20
+CHECK_INTERVAL = 3600
 
 # ─────────────────────────────────────────────────────────────────────────
-# SESSION OPENS (Irish local hour → DST handled automatically forever)
+# SESSION OPENS
 # ─────────────────────────────────────────────────────────────────────────
 SESSION_OPENS = {
     0:  ("\U0001f30f", "Asia Session Open",     "Tokyo & Sydney markets now open."),
@@ -60,13 +62,11 @@ SESSION_OPENS = {
 # ─────────────────────────────────────────────────────────────────────────
 # STATE
 # ─────────────────────────────────────────────────────────────────────────
-last_alerted      = {}
-last_session_day  = {}
-fail_count        = {p.replace("/", ""): 0     for p in PAIRS}
-fail_warned       = {p.replace("/", ""): False  for p in PAIRS}
-
-# Watchdog: updated every scan cycle — if it stops updating, process is killed
-last_scan_time = {"ts": time.time()}
+last_alerted     = {}
+last_session_day = {}
+fail_count       = {p.replace("/", ""): 0     for p in PAIRS}
+fail_warned      = {p.replace("/", ""): False  for p in PAIRS}
+last_scan_time   = {"ts": time.time()}
 
 # ─────────────────────────────────────────────────────────────────────────
 # TELEGRAM
@@ -106,16 +106,14 @@ def get_health_summary():
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────────────────────────────────
-# SESSION OPEN CHECKER (runs every minute independently)
+# SESSION CHECKER (independent 60s loop)
 # ─────────────────────────────────────────────────────────────────────────
 def session_checker_loop():
-    """Runs every 60 seconds — fires session messages within 1 min of open."""
     while True:
         try:
             now_irish = datetime.now(IRELAND_TZ)
             hour      = now_irish.hour
             today     = now_irish.date()
-
             if hour in SESSION_OPENS and last_session_day.get(hour) != today:
                 last_session_day[hour] = today
                 emoji, title, desc = SESSION_OPENS[hour]
@@ -134,28 +132,26 @@ def session_checker_loop():
         time.sleep(60)
 
 # ─────────────────────────────────────────────────────────────────────────
-# WATCHDOG (kills process if scanner hasn't run in 3 hours)
+# WATCHDOG
 # ─────────────────────────────────────────────────────────────────────────
 def watchdog_loop():
-    """Checks every 10 minutes if scanner is still alive."""
-    time.sleep(600)  # give scanner time to start first
+    time.sleep(600)
     while True:
         try:
             age = time.time() - last_scan_time["ts"]
-            if age > 10800:  # 3 hours without a scan
-                print(f"  WATCHDOG: scanner has not run for {age/3600:.1f}h — killing process")
+            if age > 10800:
+                print(f"  WATCHDOG: no scan for {age/3600:.1f}h — killing process")
                 try:
                     send_telegram(
-                        "\u26a0\ufe0f <b>Scanner watchdog triggered.</b>\n"
-                        "Scanner thread stopped unexpectedly.\n"
-                        "Restarting now automatically."
+                        "\u26a0\ufe0f <b>Watchdog triggered.</b>\n"
+                        "Scanner stopped unexpectedly. Restarting now."
                     )
                 except Exception:
                     pass
-                os._exit(1)  # hard kill — Render will restart the service
+                os._exit(1)
         except Exception as e:
             print(f"  Watchdog error: {e}")
-        time.sleep(600)  # check every 10 minutes
+        time.sleep(600)
 
 # ─────────────────────────────────────────────────────────────────────────
 # FAILURE WARNING
@@ -225,8 +221,10 @@ def fetch_pair(pair):
             return None
 
         values = data.get("values")
-        if not values or len(values) < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
-            print(f"  {name}: not enough data")
+
+        # Fix: validate values is actually a list
+        if not isinstance(values, list) or len(values) < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
+            print(f"  {name}: not enough data or invalid response")
             return None
 
         return values
@@ -248,27 +246,33 @@ def analyze(pair, values):
         lows       = [float(v["low"])   for v in values]
         closes     = [float(v["close"]) for v in values]
 
+        # Real tick volume — handle null/zero gracefully
         volumes = []
+        volume_available = False
         for v in values:
             raw = v.get("volume")
             try:
-                volumes.append(float(raw) if raw is not None else 0.0)
+                val = float(raw) if raw is not None else 0.0
             except Exception:
-                volumes.append(0.0)
+                val = 0.0
+            volumes.append(val)
+            if val > 0:
+                volume_available = True
 
         n         = len(closes)
         idx       = n - 2
         candle_ts = timestamps[idx]
 
-        # Stale candle guard
+        # Fix: stale candle guard with explicit ValueError catch
         try:
             candle_dt = datetime.strptime(candle_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             age_hours = (datetime.now(timezone.utc) - candle_dt).total_seconds() / 3600
             if age_hours > 2:
                 print(f"  {name}: candle too old ({age_hours:.1f}h) — skipping")
                 return None
-        except Exception:
-            pass
+        except ValueError as e:
+            print(f"  {name}: timestamp format error '{candle_ts}' — {e} — skipping")
+            return None
 
         atr_vals = calc_atr(highs, lows, closes, ATR_LENGTH)
         atr_idx  = len(atr_vals) - 2
@@ -294,26 +298,46 @@ def analyze(pair, values):
             return None
 
         # Rule 2 — volume above MA
-        is_above_vol_ma = (volume_now > vol_ma) if USE_VOLUME_FILTER else True
+        # Fix: if volume data is unavailable from Twelve Data, skip volume filter
+        if USE_VOLUME_FILTER:
+            if not volume_available or vol_ma == 0:
+                print(f"  {name}: volume data unavailable — skipping volume filter")
+                is_above_vol_ma = True
+            else:
+                is_above_vol_ma = volume_now > vol_ma
+        else:
+            is_above_vol_ma = True
 
         # Rule 3 — volume spike
-        vol_ratio = (volume_now / vol_ma) if vol_ma > 0 else 0
-        is_spike  = (vol_ratio >= VOLUME_SPIKE_MULTIPLIER) if USE_VOLUME_SPIKE else True
+        if USE_VOLUME_SPIKE:
+            if not volume_available or vol_ma == 0:
+                print(f"  {name}: volume data unavailable — skipping spike filter")
+                is_spike  = True
+                vol_ratio = 0.0
+            else:
+                vol_ratio = volume_now / vol_ma
+                is_spike  = vol_ratio >= VOLUME_SPIKE_MULTIPLIER
+        else:
+            vol_ratio = 0.0
+            is_spike  = True
 
         is_strong = is_above_vol_ma and is_spike
         is_bull   = closes[idx] > opens[idx]
 
-        print(f"  {name}: ATR {atr_ratio:.2f}x ✓ | Vol {vol_ratio:.2f}x | Strong={is_strong}")
+        print(f"  {name}: ATR {atr_ratio:.2f}x ✓ | "
+              f"Vol {'N/A' if not volume_available else f'{vol_ratio:.2f}x'} | "
+              f"Strong={is_strong}")
 
         return {
-            "is_strong":  is_strong,
-            "is_bull":    is_bull,
-            "atr":        atr_now,
-            "atr_ratio":  atr_ratio,
-            "vol_ma":     vol_ma,
-            "vol_ratio":  vol_ratio,
-            "candle_ts":  candle_ts,
-            "name":       name,
+            "is_strong":        is_strong,
+            "is_bull":          is_bull,
+            "atr":              atr_now,
+            "atr_ratio":        atr_ratio,
+            "vol_ma":           vol_ma,
+            "vol_ratio":        vol_ratio,
+            "volume_available": volume_available,
+            "candle_ts":        candle_ts,
+            "name":             name,
         }
 
     except Exception as e:
@@ -334,8 +358,6 @@ def scan():
 
         try:
             values = fetch_pair(pair)
-
-            # Rate limit — wait 60s and retry once
             if values == "RATE_LIMIT":
                 print(f"  {name}: waiting 60s then retrying...")
                 time.sleep(60)
@@ -343,20 +365,18 @@ def scan():
                 if values == "RATE_LIMIT":
                     print(f"  {name}: still rate limited — skipping")
                     values = None
-
         except Exception as e:
             print(f"  {name}: fetch crashed — {e}")
             values = None
 
         time.sleep(PAIR_DELAY)
 
-        if values is None or values == "RATE_LIMIT":
+        if not isinstance(values, list):
             fail_count[name] += 1
             print(f"  {name}: fail count = {fail_count[name]}")
             check_failure_warning(name)
             continue
 
-        # Recovered — reset failure state
         if fail_count[name] > 0:
             print(f"  {name}: recovered after {fail_count[name]} failures")
         fail_count[name]  = 0
@@ -392,6 +412,12 @@ def scan():
             except Exception:
                 time_str = candle_ts + " UTC"
 
+            # Volume line — show N/A if data unavailable
+            if result["volume_available"] and result["vol_ma"] > 0:
+                vol_line = f"Volume spike ratio: {result['vol_ratio']:.2f}x"
+            else:
+                vol_line = "Volume spike ratio: N/A (no tick data)"
+
             msg = (
                 f"\u26a1 <b>Strong Candle Detected!</b>\n\n"
                 f"Pair: <b>{name}</b>\n"
@@ -399,8 +425,9 @@ def scan():
                 f"Candle open: {time_str}\n\n"
                 f"ATR ({ATR_LENGTH}): {result['atr']:.5f}\n"
                 f"ATR ratio: {result['atr_ratio']:.2f}x\n"
-                f"Volume MA ({VOLUME_MA_LENGTH}): {result['vol_ma']:.0f}\n"
-                f"Volume spike ratio: {result['vol_ratio']:.2f}x\n\n"
+                f"Volume MA ({VOLUME_MA_LENGTH}): "
+                f"{'N/A' if not result['volume_available'] else f\"{result['vol_ma']:.0f}\"}\n"
+                f"{vol_line}\n\n"
                 f"Timeframe: 1H"
             )
 
@@ -413,40 +440,41 @@ def scan():
         print("  No strong candles this scan.")
 
 # ─────────────────────────────────────────────────────────────────────────
-# MAIN — scanner is the main thread
+# MAIN
 # ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
 
-    # Flask runs in background
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Validate env vars on startup
+    missing = []
+    if not TWELVE_DATA_KEY:  missing.append("TWELVE_DATA_KEY")
+    if not TELEGRAM_TOKEN:   missing.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        print(f"FATAL: Missing environment variables: {', '.join(missing)}")
+        print("Set these in Render → Environment before deploying.")
+        exit(1)
 
-    # Session checker runs in background (every 60s)
-    session_thread = threading.Thread(target=session_checker_loop, daemon=True)
-    session_thread.start()
+    # Background threads
+    threading.Thread(target=run_flask,            daemon=True).start()
+    threading.Thread(target=session_checker_loop, daemon=True).start()
+    threading.Thread(target=watchdog_loop,        daemon=True).start()
 
-    # Watchdog runs in background (every 10 min)
-    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
-    watchdog_thread.start()
-
-    # Startup message
     send_telegram(
-        "\u2705 <b>Forex Scanner — structural fix deployed!</b>\n\n"
-        "Key changes:\n"
-        "- Scanner is now the main process (no silent death)\n"
-        "- Watchdog kills and restarts if scanner freezes\n"
-        "- Session messages fire within 1 min of exact open time\n"
+        "\u2705 <b>Forex Scanner — security + stability update!</b>\n\n"
+        "Changes:\n"
+        "- Secrets moved to environment variables\n"
+        "- Volume null handled — filters skip gracefully if no tick data\n"
+        "- Stale candle timestamp errors now visible\n"
+        "- API response validation improved\n"
         "- All previous fixes retained\n\n"
         f"Settings: ATR {ATR_LENGTH} x{ATR_MULTIPLIER} | "
         f"Vol MA {VOLUME_MA_LENGTH} | Spike x{VOLUME_SPIKE_MULTIPLIER}"
     )
 
-    # Scanner runs as main loop — if this dies, entire process dies
-    # Render will auto-restart the service
     while True:
         try:
             scan()
-            last_scan_time["ts"] = time.time()  # update watchdog timestamp
+            last_scan_time["ts"] = time.time()
         except Exception as e:
             print(f"\n  SCAN ERROR: {e}")
             try:
