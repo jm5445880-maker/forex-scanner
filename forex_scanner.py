@@ -1,18 +1,27 @@
 import requests
 import time
 import threading
+import sys
+import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from flask import Flask
 
-# ─── FLASK APP (keeps Render alive) ───────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# FLASK (background thread — keeps Render alive via UptimeRobot pings)
+# ─────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Forex Scanner is running 24/7."
 
-# ─── YOUR SETTINGS ────────────────────────────────────────────────────────
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+# ─────────────────────────────────────────────────────────────────────────
+# YOUR SETTINGS
+# ─────────────────────────────────────────────────────────────────────────
 ATR_LENGTH               = 14
 ATR_MULTIPLIER           = 1.4
 USE_VOLUME_FILTER        = True
@@ -26,7 +35,6 @@ TELEGRAM_CHAT_ID = "7313311226"
 
 IRELAND_TZ = ZoneInfo("Europe/Dublin")
 
-# 7 true major forex pairs only
 PAIRS = [
     "EUR/USD",
     "GBP/USD",
@@ -37,31 +45,39 @@ PAIRS = [
     "NZD/USD",
 ]
 
-# 20 seconds between pairs = ~3 requests/min, well under 8/min limit
-PAIR_DELAY     = 20
-CHECK_INTERVAL = 3600  # scan every 60 minutes
+PAIR_DELAY     = 20    # seconds between each pair fetch
+CHECK_INTERVAL = 3600  # full scan every 60 minutes
 
-# ─── SESSION OPEN TIMES (Irish local hour) ────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# SESSION OPENS (Irish local hour → DST handled automatically forever)
+# ─────────────────────────────────────────────────────────────────────────
 SESSION_OPENS = {
     0:  ("\U0001f30f", "Asia Session Open",     "Tokyo & Sydney markets now open."),
     8:  ("\U0001f3e6", "London Session Open",   "London market now open. Highest liquidity session."),
     13: ("\U0001f5fd", "New York Session Open", "New York market now open. High volatility expected."),
 }
 
-# ─── STATE TRACKING ───────────────────────────────────────────────────────
-last_alerted     = {}
-last_session_day = {}
-fail_count       = {p.replace("/", ""): 0     for p in PAIRS}
-fail_warned      = {p.replace("/", ""): False  for p in PAIRS}
+# ─────────────────────────────────────────────────────────────────────────
+# STATE
+# ─────────────────────────────────────────────────────────────────────────
+last_alerted      = {}
+last_session_day  = {}
+fail_count        = {p.replace("/", ""): 0     for p in PAIRS}
+fail_warned       = {p.replace("/", ""): False  for p in PAIRS}
 
-# ─── TELEGRAM ─────────────────────────────────────────────────────────────
+# Watchdog: updated every scan cycle — if it stops updating, process is killed
+last_scan_time = {"ts": time.time()}
+
+# ─────────────────────────────────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────────────────────────────────
 def send_telegram(msg):
     for attempt in range(3):
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            r = requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
+            r   = requests.post(url, json={
+                "chat_id":    TELEGRAM_CHAT_ID,
+                "text":       msg,
                 "parse_mode": "HTML"
             }, timeout=10)
             if r.ok:
@@ -71,9 +87,11 @@ def send_telegram(msg):
             time.sleep(3)
     return False
 
-# ─── HEALTH SUMMARY ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# HEALTH HELPERS
+# ─────────────────────────────────────────────────────────────────────────
 def get_failing_pairs():
-    return [(name, count) for name, count in fail_count.items() if count >= 3]
+    return [(n, c) for n, c in fail_count.items() if c >= 3]
 
 def get_health_summary():
     failing = get_failing_pairs()
@@ -87,28 +105,61 @@ def get_health_summary():
     lines.append(f"\n{healthy} of {total} pairs scanning normally.")
     return "\n".join(lines)
 
-# ─── SESSION OPEN CHECKER ─────────────────────────────────────────────────
-def check_session_opens():
-    now_irish = datetime.now(IRELAND_TZ)
-    hour      = now_irish.hour
-    today     = now_irish.date()
+# ─────────────────────────────────────────────────────────────────────────
+# SESSION OPEN CHECKER (runs every minute independently)
+# ─────────────────────────────────────────────────────────────────────────
+def session_checker_loop():
+    """Runs every 60 seconds — fires session messages within 1 min of open."""
+    while True:
+        try:
+            now_irish = datetime.now(IRELAND_TZ)
+            hour      = now_irish.hour
+            today     = now_irish.date()
 
-    if hour in SESSION_OPENS:
-        if last_session_day.get(hour) != today:
-            last_session_day[hour] = today
-            emoji, title, desc = SESSION_OPENS[hour]
-            health = get_health_summary()
-            msg = (
-                f"{emoji} <b>{title}</b>\n\n"
-                f"{desc}\n"
-                f"Scanner is active. Watching {len(PAIRS)} major pairs on 1H.\n"
-                f"<i>{now_irish.strftime('%H:%M')} Irish time</i>\n\n"
-                f"{health}"
-            )
-            send_telegram(msg)
-            print(f"  Session message sent: {title}")
+            if hour in SESSION_OPENS and last_session_day.get(hour) != today:
+                last_session_day[hour] = today
+                emoji, title, desc = SESSION_OPENS[hour]
+                health = get_health_summary()
+                msg = (
+                    f"{emoji} <b>{title}</b>\n\n"
+                    f"{desc}\n"
+                    f"Scanner is active. Watching {len(PAIRS)} major pairs on 1H.\n"
+                    f"<i>{now_irish.strftime('%H:%M')} Irish time</i>\n\n"
+                    f"{health}"
+                )
+                send_telegram(msg)
+                print(f"  [{now_irish.strftime('%H:%M')}] Session message sent: {title}")
+        except Exception as e:
+            print(f"  Session checker error: {e}")
+        time.sleep(60)
 
-# ─── FAILURE WARNING ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# WATCHDOG (kills process if scanner hasn't run in 3 hours)
+# ─────────────────────────────────────────────────────────────────────────
+def watchdog_loop():
+    """Checks every 10 minutes if scanner is still alive."""
+    time.sleep(600)  # give scanner time to start first
+    while True:
+        try:
+            age = time.time() - last_scan_time["ts"]
+            if age > 10800:  # 3 hours without a scan
+                print(f"  WATCHDOG: scanner has not run for {age/3600:.1f}h — killing process")
+                try:
+                    send_telegram(
+                        "\u26a0\ufe0f <b>Scanner watchdog triggered.</b>\n"
+                        "Scanner thread stopped unexpectedly.\n"
+                        "Restarting now automatically."
+                    )
+                except Exception:
+                    pass
+                os._exit(1)  # hard kill — Render will restart the service
+        except Exception as e:
+            print(f"  Watchdog error: {e}")
+        time.sleep(600)  # check every 10 minutes
+
+# ─────────────────────────────────────────────────────────────────────────
+# FAILURE WARNING
+# ─────────────────────────────────────────────────────────────────────────
 def check_failure_warning(name):
     count = fail_count[name]
     if count == 3 and not fail_warned[name]:
@@ -121,7 +172,7 @@ def check_failure_warning(name):
         ]
         other_failing = [(n, c) for n, c in get_failing_pairs() if n != name]
         if other_failing:
-            msg_lines.append(f"\n\u26a0\ufe0f Also still failing:")
+            msg_lines.append("\n\u26a0\ufe0f Also still failing:")
             for n, c in other_failing:
                 msg_lines.append(f"  - {n}: {c} scans failed in a row")
         healthy = len(PAIRS) - len(get_failing_pairs())
@@ -129,7 +180,9 @@ def check_failure_warning(name):
         send_telegram("\n".join(msg_lines))
         print(f"  Failure warning sent for {name}")
 
-# ─── ATR CALCULATION ──────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# ATR
+# ─────────────────────────────────────────────────────────────────────────
 def calc_atr(highs, lows, closes, period):
     trs = []
     for i in range(1, len(closes)):
@@ -142,24 +195,20 @@ def calc_atr(highs, lows, closes, period):
     if len(trs) < period:
         return []
     atr = sum(trs[:period]) / period
-    atr_vals = [atr]
+    vals = [atr]
     for t in trs[period:]:
         atr = (atr * (period - 1) + t) / period
-        atr_vals.append(atr)
-    return atr_vals
+        vals.append(atr)
+    return vals
 
-# ─── FETCH ONE PAIR (with rate limit detection and auto-retry) ────────────
+# ─────────────────────────────────────────────────────────────────────────
+# FETCH ONE PAIR
+# ─────────────────────────────────────────────────────────────────────────
 def fetch_pair(pair):
-    """
-    Fetches data for one pair from Twelve Data.
-    Returns: parsed values list, or None on real error, or "RATE_LIMIT" string
-    """
     name = pair.replace("/", "")
     url  = (
         f"https://api.twelvedata.com/time_series"
-        f"?symbol={pair}"
-        f"&interval=1h"
-        f"&outputsize=100"
+        f"?symbol={pair}&interval=1h&outputsize=100"
         f"&apikey={TWELVE_DATA_KEY}"
     )
     try:
@@ -167,18 +216,17 @@ def fetch_pair(pair):
         data = r.json()
 
         if data.get("status") == "error":
-            msg = data.get("message", "").lower()
+            msg  = data.get("message", "").lower()
             code = data.get("code", 0)
-            # Detect rate limit specifically
             if "too many" in msg or "rate limit" in msg or code == 429:
-                print(f"  {name}: rate limit hit — will retry after 60s")
+                print(f"  {name}: rate limit hit")
                 return "RATE_LIMIT"
             print(f"  {name}: API error — {data.get('message')}")
             return None
 
         values = data.get("values")
         if not values or len(values) < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
-            print(f"  {name}: not enough data ({len(values) if values else 0} candles)")
+            print(f"  {name}: not enough data")
             return None
 
         return values
@@ -187,7 +235,9 @@ def fetch_pair(pair):
         print(f"  {name}: fetch error — {e}")
         return None
 
-# ─── ANALYZE ONE PAIR ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# ANALYZE ONE PAIR
+# ─────────────────────────────────────────────────────────────────────────
 def analyze(pair, values):
     name = pair.replace("/", "")
     try:
@@ -237,16 +287,16 @@ def analyze(pair, values):
         if atr_now == 0:
             return None
 
-        # Rule 1: strict ATR hard block
+        # Rule 1 — strict ATR hard block
         atr_ratio = candle_range / atr_now
         if atr_ratio < ATR_MULTIPLIER:
             print(f"  {name}: ATR {atr_ratio:.2f}x < {ATR_MULTIPLIER}x — blocked")
             return None
 
-        # Rule 2: volume above MA
+        # Rule 2 — volume above MA
         is_above_vol_ma = (volume_now > vol_ma) if USE_VOLUME_FILTER else True
 
-        # Rule 3: volume spike
+        # Rule 3 — volume spike
         vol_ratio = (volume_now / vol_ma) if vol_ma > 0 else 0
         is_spike  = (vol_ratio >= VOLUME_SPIKE_MULTIPLIER) if USE_VOLUME_SPIKE else True
 
@@ -270,9 +320,12 @@ def analyze(pair, values):
         print(f"  {name}: analyze error — {e}")
         return None
 
-# ─── SCAN ALL PAIRS ───────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# SCAN ALL PAIRS
+# ─────────────────────────────────────────────────────────────────────────
 def scan():
-    print(f"\n[{datetime.now(IRELAND_TZ).strftime('%Y-%m-%d %H:%M')} Irish] Scanning {len(PAIRS)} pairs...")
+    now_irish = datetime.now(IRELAND_TZ)
+    print(f"\n[{now_irish.strftime('%Y-%m-%d %H:%M')} Irish] Scanning {len(PAIRS)} pairs...")
     signals_found = 0
 
     for pair in PAIRS:
@@ -282,20 +335,19 @@ def scan():
         try:
             values = fetch_pair(pair)
 
-            # If rate limited — wait 60s and retry ONCE
+            # Rate limit — wait 60s and retry once
             if values == "RATE_LIMIT":
                 print(f"  {name}: waiting 60s then retrying...")
                 time.sleep(60)
                 values = fetch_pair(pair)
                 if values == "RATE_LIMIT":
-                    print(f"  {name}: still rate limited after retry — skipping")
+                    print(f"  {name}: still rate limited — skipping")
                     values = None
 
         except Exception as e:
-            print(f"  {name}: unexpected fetch crash — {e}")
+            print(f"  {name}: fetch crashed — {e}")
             values = None
 
-        # Wait 20s before next pair regardless
         time.sleep(PAIR_DELAY)
 
         if values is None or values == "RATE_LIMIT":
@@ -304,7 +356,7 @@ def scan():
             check_failure_warning(name)
             continue
 
-        # Pair fetched successfully — reset failure state
+        # Recovered — reset failure state
         if fail_count[name] > 0:
             print(f"  {name}: recovered after {fail_count[name]} failures")
         fail_count[name]  = 0
@@ -314,7 +366,7 @@ def scan():
         try:
             result = analyze(pair, values)
         except Exception as e:
-            print(f"  {name}: analyze crash — {e}")
+            print(f"  {name}: analyze crashed — {e}")
 
         if result is None:
             continue
@@ -352,7 +404,7 @@ def scan():
                 f"Timeframe: 1H"
             )
 
-            print(f"  {name}: STRONG CANDLE! {direction} — sending alert...")
+            print(f"  {name}: STRONG CANDLE! {direction} — alert sent")
             send_telegram(msg)
         else:
             print(f"  {name}: volume filters failed — no alert")
@@ -360,28 +412,46 @@ def scan():
     if signals_found == 0:
         print("  No strong candles this scan.")
 
-# ─── MAIN LOOP WITH FULL CRASH RECOVERY ───────────────────────────────────
-def scanner_loop():
+# ─────────────────────────────────────────────────────────────────────────
+# MAIN — scanner is the main thread
+# ─────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    # Flask runs in background
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Session checker runs in background (every 60s)
+    session_thread = threading.Thread(target=session_checker_loop, daemon=True)
+    session_thread.start()
+
+    # Watchdog runs in background (every 10 min)
+    watchdog_thread = threading.Thread(target=watchdog_loop, daemon=True)
+    watchdog_thread.start()
+
+    # Startup message
     send_telegram(
-        "\u2705 <b>Forex Scanner — rate limit fix deployed!</b>\n\n"
-        "Changes:\n"
-        "- 20s between pairs (safe rate limit buffer)\n"
-        "- Rate limit detected and auto-retried\n"
-        "- Real errors vs rate limits handled separately\n"
+        "\u2705 <b>Forex Scanner — structural fix deployed!</b>\n\n"
+        "Key changes:\n"
+        "- Scanner is now the main process (no silent death)\n"
+        "- Watchdog kills and restarts if scanner freezes\n"
+        "- Session messages fire within 1 min of exact open time\n"
         "- All previous fixes retained\n\n"
         f"Settings: ATR {ATR_LENGTH} x{ATR_MULTIPLIER} | "
         f"Vol MA {VOLUME_MA_LENGTH} | Spike x{VOLUME_SPIKE_MULTIPLIER}"
     )
 
+    # Scanner runs as main loop — if this dies, entire process dies
+    # Render will auto-restart the service
     while True:
         try:
-            check_session_opens()
             scan()
+            last_scan_time["ts"] = time.time()  # update watchdog timestamp
         except Exception as e:
-            print(f"\n  LOOP CRASH: {e} — recovering in 5 minutes...")
+            print(f"\n  SCAN ERROR: {e}")
             try:
                 send_telegram(
-                    f"\u26a0\ufe0f Scanner hit an unexpected error but recovered automatically.\n"
+                    f"\u26a0\ufe0f Scanner error — recovering.\n"
                     f"<code>{str(e)[:200]}</code>"
                 )
             except Exception:
@@ -391,9 +461,3 @@ def scanner_loop():
 
         print(f"  Next scan in 60 minutes...\n")
         time.sleep(CHECK_INTERVAL)
-
-# ─── STARTUP ──────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    thread = threading.Thread(target=scanner_loop, daemon=True)
-    thread.start()
-    app.run(host="0.0.0.0", port=10000)
