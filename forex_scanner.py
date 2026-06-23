@@ -1,492 +1,162 @@
 import os
-import requests
 import time
 import threading
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+import datetime as dt
+import requests
 from flask import Flask
 
-# ─────────────────────────────────────────────────────────────────────────
-# FLASK (background thread)
-# ─────────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+# ─── KEYS (read from Render environment variables) ─────────────────────────
+TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY", "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-@app.route('/')
-def home():
-    return "Forex Scanner is running 24/7."
-
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-# ─────────────────────────────────────────────────────────────────────────
-# SECRETS — loaded from environment variables (set these in Render)
-# ─────────────────────────────────────────────────────────────────────────
-TWELVE_DATA_KEY  = os.environ.get("TWELVE_DATA_KEY")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-# ─────────────────────────────────────────────────────────────────────────
-# YOUR SETTINGS
-# ─────────────────────────────────────────────────────────────────────────
-ATR_LENGTH               = 14
-ATR_MULTIPLIER           = 1.4
-USE_VOLUME_FILTER        = True
-VOLUME_MA_LENGTH         = 20
-USE_VOLUME_SPIKE         = True
-VOLUME_SPIKE_MULTIPLIER  = 1.4
-
-IRELAND_TZ = ZoneInfo("Europe/Dublin")
-
+# ─── PAIRS: 7 true USD majors ──────────────────────────────────────────────
 PAIRS = [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "AUD/USD",
-    "USD/CAD",
-    "NZD/USD",
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "USD/CAD", "NZD/USD",
 ]
 
-PAIR_DELAY     = 20
-CHECK_INTERVAL = 3600
+CHECK_INTERVAL = 3600          # run once per hour
+STALE_HOURS    = 3             # ignore data older than this (market closed / frozen feed)
 
-# ─────────────────────────────────────────────────────────────────────────
-# SESSION OPENS
-# ─────────────────────────────────────────────────────────────────────────
-SESSION_OPENS = {
-    0:  ("\U0001f30f", "Asia Session Open",     "Tokyo & Sydney markets now open."),
-    8:  ("\U0001f3e6", "London Session Open",   "London market now open. Highest liquidity session."),
-    13: ("\U0001f5fd", "New York Session Open", "New York market now open. High volatility expected."),
-}
+# ─── STATE: remember what we've already alerted, so it never repeats ───────
+# key = (pair, level_name, direction) -> the level price we last alerted on
+# When a new day/week forms, the level price changes, which re-arms the alert.
+alerted = {}
 
-# ─────────────────────────────────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────────────────────────────────
-last_alerted     = {}
-last_session_day = {}
-fail_count       = {p.replace("/", ""): 0     for p in PAIRS}
-fail_warned      = {p.replace("/", ""): False  for p in PAIRS}
-last_scan_time   = {"ts": time.time()}
+app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────────────────────────────────
+@app.route("/")
+def home():
+    return "Forex level-cross scanner running."
+
+# ─── TELEGRAM ──────────────────────────────────────────────────────────────
 def send_telegram(msg):
-    for attempt in range(3):
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            r   = requests.post(url, json={
-                "chat_id":    TELEGRAM_CHAT_ID,
-                "text":       msg,
-                "parse_mode": "HTML"
-            }, timeout=10)
-            if r.ok:
-                return True
-        except Exception as e:
-            print(f"  Telegram error (attempt {attempt+1}): {e}")
-            time.sleep(3)
-    return False
-
-# ─────────────────────────────────────────────────────────────────────────
-# HEALTH HELPERS
-# ─────────────────────────────────────────────────────────────────────────
-def get_failing_pairs():
-    return [(n, c) for n, c in fail_count.items() if c >= 3]
-
-def get_health_summary():
-    failing = get_failing_pairs()
-    total   = len(PAIRS)
-    if not failing:
-        return f"\u2705 All {total} pairs scanning normally."
-    healthy = total - len(failing)
-    lines   = ["\u26a0\ufe0f Pair issues detected:"]
-    for name, count in failing:
-        lines.append(f"  - {name}: failed {count} scans in a row")
-    lines.append(f"\n{healthy} of {total} pairs scanning normally.")
-    return "\n".join(lines)
-
-# ─────────────────────────────────────────────────────────────────────────
-# SESSION CHECKER (independent 60s loop)
-# ─────────────────────────────────────────────────────────────────────────
-def session_checker_loop():
-    while True:
-        try:
-            now_irish = datetime.now(IRELAND_TZ)
-            hour      = now_irish.hour
-            today     = now_irish.date()
-            if hour in SESSION_OPENS and last_session_day.get(hour) != today:
-                last_session_day[hour] = today
-                emoji, title, desc = SESSION_OPENS[hour]
-                health = get_health_summary()
-                msg = (
-                    f"{emoji} <b>{title}</b>\n\n"
-                    f"{desc}\n"
-                    f"Scanner is active. Watching {len(PAIRS)} major pairs on 1H.\n"
-                    f"<i>{now_irish.strftime('%H:%M')} Irish time</i>\n\n"
-                    f"{health}"
-                )
-                send_telegram(msg)
-                print(f"  [{now_irish.strftime('%H:%M')}] Session message sent: {title}")
-        except Exception as e:
-            print(f"  Session checker error: {e}")
-        time.sleep(60)
-
-# ─────────────────────────────────────────────────────────────────────────
-# WATCHDOG
-# ─────────────────────────────────────────────────────────────────────────
-def watchdog_loop():
-    time.sleep(600)
-    while True:
-        try:
-            age = time.time() - last_scan_time["ts"]
-            if age > 10800:
-                print(f"  WATCHDOG: no scan for {age/3600:.1f}h — killing process")
-                try:
-                    send_telegram(
-                        "\u26a0\ufe0f <b>Watchdog triggered.</b>\n"
-                        "Scanner stopped unexpectedly. Restarting now."
-                    )
-                except Exception:
-                    pass
-                os._exit(1)
-        except Exception as e:
-            print(f"  Watchdog error: {e}")
-        time.sleep(600)
-
-# ─────────────────────────────────────────────────────────────────────────
-# FAILURE WARNING
-# ─────────────────────────────────────────────────────────────────────────
-def check_failure_warning(name):
-    count = fail_count[name]
-    if count == 3 and not fail_warned[name]:
-        fail_warned[name] = True
-        msg_lines = [
-            f"\u26a0\ufe0f <b>Scanner Warning</b>\n",
-            f"<b>{name}</b> has failed 3 scans in a row.",
-            f"Data could not be fetched from Twelve Data.",
-            f"You may be missing signals on this pair.",
-        ]
-        other_failing = [(n, c) for n, c in get_failing_pairs() if n != name]
-        if other_failing:
-            msg_lines.append("\n\u26a0\ufe0f Also still failing:")
-            for n, c in other_failing:
-                msg_lines.append(f"  - {n}: {c} scans failed in a row")
-        healthy = len(PAIRS) - len(get_failing_pairs())
-        msg_lines.append(f"\n{healthy} of {len(PAIRS)} pairs scanning normally.")
-        send_telegram("\n".join(msg_lines))
-        print(f"  Failure warning sent for {name}")
-
-# ─────────────────────────────────────────────────────────────────────────
-# ATR
-# ─────────────────────────────────────────────────────────────────────────
-def calc_atr(highs, lows, closes, period):
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
-        )
-        trs.append(tr)
-    if len(trs) < period:
-        return []
-    atr = sum(trs[:period]) / period
-    vals = [atr]
-    for t in trs[period:]:
-        atr = (atr * (period - 1) + t) / period
-        vals.append(atr)
-    return vals
-
-# ─────────────────────────────────────────────────────────────────────────
-# FETCH ONE PAIR
-# ─────────────────────────────────────────────────────────────────────────
-def fetch_pair(pair):
-    name = pair.replace("/", "")
-    url  = (
-        f"https://api.twelvedata.com/time_series"
-        f"?symbol={pair}&interval=1h&outputsize=100"
-        f"&apikey={TWELVE_DATA_KEY}"
-    )
     try:
-        r    = requests.get(url, timeout=20)
-        data = r.json()
-
-        if data.get("status") == "error":
-            msg  = data.get("message", "").lower()
-            code = data.get("code", 0)
-            if "too many" in msg or "rate limit" in msg or code == 429:
-                print(f"  {name}: rate limit hit")
-                return "RATE_LIMIT"
-            print(f"  {name}: API error — {data.get('message')}")
-            return None
-
-        values = data.get("values")
-
-        # Fix: validate values is actually a list
-        if not isinstance(values, list) or len(values) < ATR_LENGTH + VOLUME_MA_LENGTH + 5:
-            print(f"  {name}: not enough data or invalid response")
-            return None
-
-        return values
-
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+        }, timeout=10)
     except Exception as e:
-        print(f"  {name}: fetch error — {e}")
-        return None
+        print(f"  Telegram error: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────
-# ANALYZE ONE PAIR
-# ─────────────────────────────────────────────────────────────────────────
-def analyze(pair, values):
+# ─── MARKET OPEN CHECK (UTC) ───────────────────────────────────────────────
+# Forex week: opens ~Sun 22:00 UTC, closes ~Fri 22:00 UTC.
+def market_open(now=None):
+    now = now or dt.datetime.now(dt.timezone.utc)
+    wd = now.weekday()          # Mon=0 ... Sat=5, Sun=6
+    if wd == 5:                 # Saturday: closed all day
+        return False
+    if wd == 6:                 # Sunday: opens 22:00 UTC
+        return now.hour >= 22
+    if wd == 4:                 # Friday: closes 22:00 UTC
+        return now.hour < 22
+    return True                 # Mon–Thu: open
+
+# ─── TWELVE DATA FETCH ─────────────────────────────────────────────────────
+def fetch(symbol, interval, outputsize):
+    url = (f"https://api.twelvedata.com/time_series?symbol={symbol}"
+           f"&interval={interval}&outputsize={outputsize}&apikey={TWELVE_DATA_KEY}")
+    r = requests.get(url, timeout=20)
+    data = r.json()
+    if data.get("status") == "error":
+        print(f"  {symbol} {interval}: API error - {data.get('message')}")
+        return None
+    return data.get("values")   # newest first
+
+def prev_period_levels(symbol, interval):
+    # index 0 = current forming period, index 1 = previous COMPLETED period
+    vals = fetch(symbol, interval, 3)
+    if not vals or len(vals) < 2:
+        return None, None
+    prev = vals[1]
+    return float(prev["high"]), float(prev["low"])
+
+def last_two_closed_1h(symbol):
+    vals = fetch(symbol, "1h", 5)
+    if not vals or len(vals) < 3:
+        return None
+    # Drop a still-forming top bar if its hour == current UTC hour
+    now = dt.datetime.now(dt.timezone.utc)
+    top_time = vals[0]["datetime"]          # "YYYY-MM-DD HH:MM:SS"
+    forming = top_time[:13] == now.strftime("%Y-%m-%d %H")
+    base = 1 if forming else 0
+    last = vals[base]
+    prev = vals[base + 1]
+    # Stale guard: last closed candle must be recent
+    t = dt.datetime.strptime(last["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+    if (now - t).total_seconds() > STALE_HOURS * 3600:
+        return None
+    return float(prev["close"]), float(last["close"]), float(last["high"]), float(last["low"])
+
+# ─── CROSS LOGIC ───────────────────────────────────────────────────────────
+def check_cross(prev_close, last_close, level):
+    # Did the close move through the level between the last two closed bars?
+    if prev_close < level <= last_close:
+        return "up"
+    if prev_close > level >= last_close:
+        return "down"
+    return None
+
+def fmt(symbol, price):
+    digits = 3 if "JPY" in symbol else 5
+    return f"{price:.{digits}f}"
+
+def scan_pair(pair):
     name = pair.replace("/", "")
     try:
-        values     = list(reversed(values))
-        timestamps = [v["datetime"] for v in values]
-        opens      = [float(v["open"])  for v in values]
-        highs      = [float(v["high"])  for v in values]
-        lows       = [float(v["low"])   for v in values]
-        closes     = [float(v["close"]) for v in values]
+        c = last_two_closed_1h(pair)
+        if not c:
+            print(f"  {name}: no fresh candle")
+            return
+        prev_close, last_close, _, _ = c
 
-        # Real tick volume — handle null/zero gracefully
-        volumes = []
-        volume_available = False
-        for v in values:
-            raw = v.get("volume")
-            try:
-                val = float(raw) if raw is not None else 0.0
-            except Exception:
-                val = 0.0
-            volumes.append(val)
-            if val > 0:
-                volume_available = True
+        pdh, pdl = prev_period_levels(pair, "1day")
+        pwh, pwl = prev_period_levels(pair, "1week")
 
-        n         = len(closes)
-        idx       = n - 2
-        candle_ts = timestamps[idx]
-
-        # Fix: stale candle guard with explicit ValueError catch
-        try:
-            candle_dt = datetime.strptime(candle_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - candle_dt).total_seconds() / 3600
-            if age_hours > 2:
-                print(f"  {name}: candle too old ({age_hours:.1f}h) — skipping")
-                return None
-        except ValueError as e:
-            print(f"  {name}: timestamp format error '{candle_ts}' — {e} — skipping")
-            return None
-
-        atr_vals = calc_atr(highs, lows, closes, ATR_LENGTH)
-        atr_idx  = len(atr_vals) - 2
-        if atr_idx < 0:
-            return None
-
-        vol_window = volumes[idx - VOLUME_MA_LENGTH + 1: idx + 1]
-        if len(vol_window) < VOLUME_MA_LENGTH:
-            return None
-
-        vol_ma       = sum(vol_window) / VOLUME_MA_LENGTH
-        candle_range = highs[idx] - lows[idx]
-        atr_now      = atr_vals[atr_idx]
-        volume_now   = volumes[idx]
-
-        if atr_now == 0:
-            return None
-
-        # Rule 1 — strict ATR hard block
-        atr_ratio = candle_range / atr_now
-        if atr_ratio < ATR_MULTIPLIER:
-            print(f"  {name}: ATR {atr_ratio:.2f}x < {ATR_MULTIPLIER}x — blocked")
-            return None
-
-        # Rule 2 — volume above MA
-        # Fix: if volume data is unavailable from Twelve Data, skip volume filter
-        if USE_VOLUME_FILTER:
-            if not volume_available or vol_ma == 0:
-                print(f"  {name}: volume data unavailable — skipping volume filter")
-                is_above_vol_ma = True
-            else:
-                is_above_vol_ma = volume_now > vol_ma
-        else:
-            is_above_vol_ma = True
-
-        # Rule 3 — volume spike
-        if USE_VOLUME_SPIKE:
-            if not volume_available or vol_ma == 0:
-                print(f"  {name}: volume data unavailable — skipping spike filter")
-                is_spike  = True
-                vol_ratio = 0.0
-            else:
-                vol_ratio = volume_now / vol_ma
-                is_spike  = vol_ratio >= VOLUME_SPIKE_MULTIPLIER
-        else:
-            vol_ratio = 0.0
-            is_spike  = True
-
-        is_strong = is_above_vol_ma and is_spike
-        is_bull   = closes[idx] > opens[idx]
-
-        print(f"  {name}: ATR {atr_ratio:.2f}x ✓ | "
-              f"Vol {'N/A' if not volume_available else f'{vol_ratio:.2f}x'} | "
-              f"Strong={is_strong}")
-
-        return {
-            "is_strong":        is_strong,
-            "is_bull":          is_bull,
-            "atr":              atr_now,
-            "atr_ratio":        atr_ratio,
-            "vol_ma":           vol_ma,
-            "vol_ratio":        vol_ratio,
-            "volume_available": volume_available,
-            "candle_ts":        candle_ts,
-            "name":             name,
+        levels = {
+            "Previous Day High":  pdh,
+            "Previous Day Low":   pdl,
+            "Previous Week High": pwh,
+            "Previous Week Low":  pwl,
         }
 
-    except Exception as e:
-        print(f"  {name}: analyze error — {e}")
-        return None
-
-# ─────────────────────────────────────────────────────────────────────────
-# SCAN ALL PAIRS
-# ─────────────────────────────────────────────────────────────────────────
-def scan():
-    now_irish = datetime.now(IRELAND_TZ)
-    print(f"\n[{now_irish.strftime('%Y-%m-%d %H:%M')} Irish] Scanning {len(PAIRS)} pairs...")
-    signals_found = 0
-
-    for pair in PAIRS:
-        name   = pair.replace("/", "")
-        values = None
-
-        try:
-            values = fetch_pair(pair)
-            if values == "RATE_LIMIT":
-                print(f"  {name}: waiting 60s then retrying...")
-                time.sleep(60)
-                values = fetch_pair(pair)
-                if values == "RATE_LIMIT":
-                    print(f"  {name}: still rate limited — skipping")
-                    values = None
-        except Exception as e:
-            print(f"  {name}: fetch crashed — {e}")
-            values = None
-
-        time.sleep(PAIR_DELAY)
-
-        if not isinstance(values, list):
-            fail_count[name] += 1
-            print(f"  {name}: fail count = {fail_count[name]}")
-            check_failure_warning(name)
-            continue
-
-        if fail_count[name] > 0:
-            print(f"  {name}: recovered after {fail_count[name]} failures")
-        fail_count[name]  = 0
-        fail_warned[name] = False
-
-        result = None
-        try:
-            result = analyze(pair, values)
-        except Exception as e:
-            print(f"  {name}: analyze crashed — {e}")
-
-        if result is None:
-            continue
-
-        if result["is_strong"]:
-            candle_ts = result["candle_ts"]
-
-            if last_alerted.get(name) == candle_ts:
-                print(f"  {name}: already alerted for this candle")
+        for lname, lvl in levels.items():
+            if lvl is None:
                 continue
-
-            last_alerted[name] = candle_ts
-            signals_found += 1
-
-            direction = "Bullish" if result["is_bull"] else "Bearish"
-            emoji     = "\U0001f7e2" if result["is_bull"] else "\U0001f534"
-
-            try:
-                open_utc   = datetime.strptime(candle_ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                open_irish = open_utc.astimezone(IRELAND_TZ)
-                time_str   = (f"{open_utc.strftime('%Y-%m-%d %H:%M')} UTC "
-                              f"({open_irish.strftime('%H:%M')} Irish)")
-            except Exception:
-                time_str = candle_ts + " UTC"
-
-            # Volume line — show N/A if data unavailable
-            if result["volume_available"] and result["vol_ma"] > 0:
-                vol_line = f"Volume spike ratio: {result['vol_ratio']:.2f}x"
-            else:
-                vol_line = "Volume spike ratio: N/A (no tick data)"
-
-            vol_ma_str = "N/A" if not result["volume_available"] else str(int(result["vol_ma"]))
-
-            msg = (
-                f"\u26a1 <b>Strong Candle Detected!</b>\n\n"
-                f"Pair: <b>{name}</b>\n"
-                f"Direction: {emoji} {direction}\n"
-                f"Candle open: {time_str}\n\n"
-                f"ATR ({ATR_LENGTH}): {result['atr']:.5f}\n"
-                f"ATR ratio: {result['atr_ratio']:.2f}x\n"
-                f"Volume MA ({VOLUME_MA_LENGTH}): {vol_ma_str}\n"
-                f"{vol_line}\n\n"
-                f"Timeframe: 1H"
+            direction = check_cross(prev_close, last_close, lvl)
+            if not direction:
+                continue
+            key = (pair, lname, direction)
+            if alerted.get(key) == lvl:      # already alerted this exact level/direction
+                continue
+            alerted[key] = lvl
+            arrow = "🟢⬆️" if direction == "up" else "🔴⬇️"
+            word  = "above" if direction == "up" else "below"
+            send_telegram(
+                f"{arrow} <b>{name} crossed {word} {lname}</b>\n"
+                f"Level {fmt(pair, lvl)} | Close {fmt(pair, last_close)}"
             )
+            print(f"  {name}: ALERT {lname} {direction}")
+    except Exception as e:
+        print(f"  {name}: error {e}")
 
-            print(f"  {name}: STRONG CANDLE! {direction} — alert sent")
-            send_telegram(msg)
-        else:
-            print(f"  {name}: volume filters failed — no alert")
-
-    if signals_found == 0:
-        print("  No strong candles this scan.")
-
-# ─────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-
-    # Validate env vars on startup
-    missing = []
-    if not TWELVE_DATA_KEY:  missing.append("TWELVE_DATA_KEY")
-    if not TELEGRAM_TOKEN:   missing.append("TELEGRAM_TOKEN")
-    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
-    if missing:
-        print(f"FATAL: Missing environment variables: {', '.join(missing)}")
-        print("Set these in Render → Environment before deploying.")
-        exit(1)
-
-    # Background threads
-    threading.Thread(target=run_flask,            daemon=True).start()
-    threading.Thread(target=session_checker_loop, daemon=True).start()
-    threading.Thread(target=watchdog_loop,        daemon=True).start()
-
-    send_telegram(
-        "\u2705 <b>Forex Scanner — security + stability update!</b>\n\n"
-        "Changes:\n"
-        "- Secrets moved to environment variables\n"
-        "- Volume null handled — filters skip gracefully if no tick data\n"
-        "- Stale candle timestamp errors now visible\n"
-        "- API response validation improved\n"
-        "- All previous fixes retained\n\n"
-        f"Settings: ATR {ATR_LENGTH} x{ATR_MULTIPLIER} | "
-        f"Vol MA {VOLUME_MA_LENGTH} | Spike x{VOLUME_SPIKE_MULTIPLIER}"
-    )
-
+# ─── MAIN LOOP ─────────────────────────────────────────────────────────────
+def scanner_loop():
+    send_telegram("✅ <b>Level-cross scanner is live.</b>\n"
+                  "Alerts only when a 1H candle closes through a Prev Day / Week High or Low.")
     while True:
-        try:
-            scan()
-            last_scan_time["ts"] = time.time()
-        except Exception as e:
-            print(f"\n  SCAN ERROR: {e}")
-            try:
-                send_telegram(
-                    f"\u26a0\ufe0f Scanner error — recovering.\n"
-                    f"<code>{str(e)[:200]}</code>"
-                )
-            except Exception:
-                pass
-            time.sleep(300)
-            continue
-
-        print(f"  Next scan in 60 minutes...\n")
+        if market_open():
+            print("Scan start", dt.datetime.now(dt.timezone.utc))
+            for p in PAIRS:
+                scan_pair(p)
+                time.sleep(20)          # stay under Twelve Data 8 req/min
+        else:
+            print("Market closed — skipping scan.")
         time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    threading.Thread(target=scanner_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000)
