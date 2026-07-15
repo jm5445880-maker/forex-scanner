@@ -23,7 +23,6 @@ WEEKLY_LINES = 2      # line 1 = last week, line 2 = the week before
 # ─── SETTINGS ──────────────────────────────────────────────────────────────
 CHECK_MINUTE   = 5
 LEVEL_TIMEZONE = "America/New_York"
-REARM_PCT      = 0.0005     # price must clear a line by this before its 2nd alert
 MAX_ALERTS     = 2
 PRUNE_DAYS     = 60         # forget stored counts older than this (housekeeping)
 
@@ -31,7 +30,6 @@ PRUNE_DAYS     = 60         # forget stored counts older than this (housekeeping
 levels_cache = {}     # pair -> [ {key, price, line, type, date} ]
 levels_day   = None
 counts       = {}     # key -> alerts used (PERSISTENT)
-armed        = {}     # key -> bool (in-memory leave/return gate)
 
 app = Flask(__name__)
 
@@ -152,20 +150,13 @@ def check_pair(pair, c_high, c_low):
         used = counts.get(key, 0)
         if used >= MAX_ALERTS:
             continue
-
-        in_range = c_low <= price <= c_high
-        if not in_range and not armed.get(key, True):
-            if min(abs(price - c_low), abs(price - c_high)) > price * REARM_PCT:
-                armed[key] = True
-
-        if in_range and armed.get(key, True):
-            armed[key] = False
+        if c_low <= price <= c_high:
             counts[key] = used + 1
             save_counts()
             arrow = "🟢⬆️" if "High" in lv["type"] else "🔴⬇️"
             send_telegram(
                 f"{arrow} <b>{pair.replace('/','')} {lv['type']} · line {lv['line']}</b>\n"
-                f"Price {fmt(pair, price)} · {dmy(lv['date'])} (alert {used+1}/{MAX_ALERTS})"
+                f"Price {fmt(pair, price)} · {dmy(lv['date'])}"
             )
             print(f"  ALERT {key} line{lv['line']} ({used+1}/{MAX_ALERTS})")
 
